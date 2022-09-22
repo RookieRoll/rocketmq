@@ -37,6 +37,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.rocketmq.acl.PermissionChecker;
 import org.apache.rocketmq.acl.common.AclConstants;
 import org.apache.rocketmq.acl.common.AclException;
 import org.apache.rocketmq.acl.common.AclUtils;
@@ -81,9 +82,11 @@ public class PlainPermissionManager {
 
     private List<String> fileList = new ArrayList<>();
 
+    private final PermissionChecker permissionChecker = new PlainPermissionChecker();
+
     public PlainPermissionManager() {
         this.defaultAclDir = MixAll.dealFilePath(fileHome + File.separator + "conf" + File.separator + "acl");
-        this.defaultAclFile = MixAll.dealFilePath(fileHome + File.separator + System.getProperty("rocketmq.acl.plain.file", "conf/plain_acl.yml"));
+        this.defaultAclFile = MixAll.dealFilePath(fileHome + File.separator + System.getProperty("rocketmq.acl.plain.file", "conf" + File.separator + "plain_acl.yml"));
         load();
         watch();
     }
@@ -93,7 +96,7 @@ public class PlainPermissionManager {
             log.info("The default acl dir {} is not exist", path);
             return new ArrayList<>();
         }
-        List<String>  allAclFileFullPath = new ArrayList<>();
+        List<String> allAclFileFullPath = new ArrayList<>();
         File file = new File(path);
         File[] files = file.listFiles();
         for (int i = 0; i < files.length; i++) {
@@ -136,7 +139,7 @@ public class PlainPermissionManager {
                 log.warn("No data in file {}", currentFile);
                 continue;
             }
-            log.info("Broker plain acl conf data is : ", plainAclConfData.toString());
+            log.info("Broker plain acl conf data is : {}", plainAclConfData.toString());
 
             List<RemoteAddressStrategy> globalWhiteRemoteAddressStrategyList = new ArrayList<>();
             JSONArray globalWhiteRemoteAddressesList = plainAclConfData.getJSONArray("globalWhiteRemoteAddresses");
@@ -162,7 +165,7 @@ public class PlainPermissionManager {
                         plainAccessResourceMap.put(plainAccessResource.getAccessKey(), plainAccessResource);
                         accessKeyTable.put(plainAccessResource.getAccessKey(), currentFile);
                     } else {
-                        log.warn("The accesssKey {} is repeated in multiple ACL files", plainAccessResource.getAccessKey());
+                        log.warn("The accessKey {} is repeated in multiple ACL files", plainAccessResource.getAccessKey());
                     }
                 }
             }
@@ -218,7 +221,7 @@ public class PlainPermissionManager {
             log.warn("No data in {}, skip it", aclFilePath);
             return;
         }
-        log.info("Broker plain acl conf data is : ", plainAclConfData.toString());
+        log.info("Broker plain acl conf data is : {}", plainAclConfData.toString());
         JSONArray globalWhiteRemoteAddressesList = plainAclConfData.getJSONArray("globalWhiteRemoteAddresses");
         if (globalWhiteRemoteAddressesList != null && !globalWhiteRemoteAddressesList.isEmpty()) {
             for (int i = 0; i < globalWhiteRemoteAddressesList.size(); i++) {
@@ -235,7 +238,6 @@ public class PlainPermissionManager {
             }
             this.globalWhiteRemoteAddressStrategyMap.put(aclFilePath, globalWhiteRemoteAddressStrategy);
         }
-
 
         JSONArray accounts = plainAclConfData.getJSONArray(AclConstants.CONFIG_ACCOUNTS);
         if (accounts != null && !accounts.isEmpty()) {
@@ -266,7 +268,6 @@ public class PlainPermissionManager {
             this.dataVersion.assignNewOne(dataVersion);
         }
     }
-
 
     @Deprecated
     public String getAclConfigDataVersion() {
@@ -344,7 +345,7 @@ public class PlainPermissionManager {
                 accountMap.put(plainAccessConfig.getAccessKey(), buildPlainAccessResource(plainAccessConfig));
             } else {
                 for (Map.Entry<String, PlainAccessResource> entry : accountMap.entrySet()) {
-                    if (entry.getValue().equals(plainAccessConfig.getAccessKey())) {
+                    if (entry.getValue().getAccessKey().equals(plainAccessConfig.getAccessKey())) {
                         PlainAccessResource plainAccessResource = buildPlainAccessResource(plainAccessConfig);
                         accountMap.put(entry.getKey(), plainAccessResource);
                         break;
@@ -576,40 +577,7 @@ public class PlainPermissionManager {
     }
 
     void checkPerm(PlainAccessResource needCheckedAccess, PlainAccessResource ownedAccess) {
-        if (Permission.needAdminPerm(needCheckedAccess.getRequestCode()) && !ownedAccess.isAdmin()) {
-            throw new AclException(String.format("Need admin permission for request code=%d, but accessKey=%s is not", needCheckedAccess.getRequestCode(), ownedAccess.getAccessKey()));
-        }
-        Map<String, Byte> needCheckedPermMap = needCheckedAccess.getResourcePermMap();
-        Map<String, Byte> ownedPermMap = ownedAccess.getResourcePermMap();
-
-        if (needCheckedPermMap == null) {
-            // If the needCheckedPermMap is null,then return
-            return;
-        }
-
-        if (ownedPermMap == null && ownedAccess.isAdmin()) {
-            // If the ownedPermMap is null and it is an admin user, then return
-            return;
-        }
-
-        for (Map.Entry<String, Byte> needCheckedEntry : needCheckedPermMap.entrySet()) {
-            String resource = needCheckedEntry.getKey();
-            Byte neededPerm = needCheckedEntry.getValue();
-            boolean isGroup = PlainAccessResource.isRetryTopic(resource);
-
-            if (ownedPermMap == null || !ownedPermMap.containsKey(resource)) {
-                // Check the default perm
-                byte ownedPerm = isGroup ? ownedAccess.getDefaultGroupPerm() :
-                    ownedAccess.getDefaultTopicPerm();
-                if (!Permission.checkPermission(neededPerm, ownedPerm)) {
-                    throw new AclException(String.format("No default permission for %s", PlainAccessResource.printStr(resource, isGroup)));
-                }
-                continue;
-            }
-            if (!Permission.checkPermission(neededPerm, ownedPermMap.get(resource))) {
-                throw new AclException(String.format("No default permission for %s", PlainAccessResource.printStr(resource, isGroup)));
-            }
-        }
+        permissionChecker.check(needCheckedAccess, ownedAccess);
     }
 
     void clearPermissionInfo() {
@@ -631,23 +599,8 @@ public class PlainPermissionManager {
 
     public PlainAccessResource buildPlainAccessResource(PlainAccessConfig plainAccessConfig) throws AclException {
         checkPlainAccessConfig(plainAccessConfig);
-        PlainAccessResource plainAccessResource = new PlainAccessResource();
-        plainAccessResource.setAccessKey(plainAccessConfig.getAccessKey());
-        plainAccessResource.setSecretKey(plainAccessConfig.getSecretKey());
-        plainAccessResource.setWhiteRemoteAddress(plainAccessConfig.getWhiteRemoteAddress());
-
-        plainAccessResource.setAdmin(plainAccessConfig.isAdmin());
-
-        plainAccessResource.setDefaultGroupPerm(Permission.parsePermFromString(plainAccessConfig.getDefaultGroupPerm()));
-        plainAccessResource.setDefaultTopicPerm(Permission.parsePermFromString(plainAccessConfig.getDefaultTopicPerm()));
-
-        Permission.parseResourcePerms(plainAccessResource, false, plainAccessConfig.getGroupPerms());
-        Permission.parseResourcePerms(plainAccessResource, true, plainAccessConfig.getTopicPerms());
-
-        plainAccessResource.setRemoteAddressStrategy(remoteAddressStrategyFactory.
-            getRemoteAddressStrategy(plainAccessResource.getWhiteRemoteAddress()));
-
-        return plainAccessResource;
+        return PlainAccessResource.build(plainAccessConfig, remoteAddressStrategyFactory.
+            getRemoteAddressStrategy(plainAccessConfig.getWhiteRemoteAddress()));
     }
 
     public void validate(PlainAccessResource plainAccessResource) {
@@ -691,7 +644,6 @@ public class PlainPermissionManager {
                 return;
             }
         }
-
 
         // Check perm of each resource
         checkPerm(plainAccessResource, ownedAccess);
